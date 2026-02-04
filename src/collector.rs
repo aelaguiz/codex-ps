@@ -7,21 +7,34 @@ use crate::codex_home::CodexHome;
 use crate::discovery::{extract_thread_id_from_rollout_path, lsof_codex_processes};
 use crate::git::GitCache;
 use crate::model::{HostError, SessionBuilder, SessionDebug, SessionRow, SessionStatus, Snapshot};
-use crate::rollout::read_session_meta;
+use crate::names::{NamesStore, SessionNameKey};
+use crate::rollout::{
+    PendingFunctionCall, read_pending_function_call_from_tail, read_session_meta,
+};
 use crate::titles::TitleResolver;
 use crate::util::{system_time_to_unix_s, truncate_middle};
 
 const STATUS_WORKING_MAX_AGE_SECS: u64 = 15;
 const STATUS_UNCERTAIN_MAX_AGE_SECS: u64 = 60;
 const STATUS_MAX_FUTURE_MTIME_SKEW_SECS: u64 = 2;
+const ROLLOUT_TAIL_MAX_BYTES: u64 = 512 * 1024;
 
 pub struct Collector {
     codex_home: CodexHome,
     titles: TitleResolver,
+    names: NamesStore,
     git_cache: GitCache,
     ssh_bin: String,
     remote_bin: String,
     ssh_timeout: Duration,
+    rollout_tail_cache: HashMap<std::path::PathBuf, TailCacheEntry>,
+}
+
+#[derive(Clone, Debug)]
+struct TailCacheEntry {
+    mtime: Option<SystemTime>,
+    parsed_for_mtime: bool,
+    pending_call: Option<PendingFunctionCall>,
 }
 
 impl Collector {
@@ -30,15 +43,17 @@ impl Collector {
         ssh_bin: String,
         remote_bin: String,
         ssh_timeout: Duration,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             titles: TitleResolver::new(&codex_home.root),
+            names: NamesStore::new()?,
             git_cache: GitCache::new(Duration::from_secs(5)),
             codex_home,
             ssh_bin,
             remote_bin,
             ssh_timeout,
-        }
+            rollout_tail_cache: HashMap::new(),
+        })
     }
 
     pub fn collect(&mut self, hosts: &[String], debug: bool) -> anyhow::Result<Snapshot> {
@@ -86,6 +101,22 @@ impl Collector {
             }
         }
 
+        if let Err(e) = self.names.refresh_if_changed() {
+            if debug {
+                warnings.push(format!(
+                    "names store ({}): {e}",
+                    self.names.path().display()
+                ));
+            }
+        }
+        for row in &mut sessions {
+            let key = SessionNameKey {
+                host: row.host.clone(),
+                thread_id: row.thread_id.clone(),
+            };
+            row.name = self.names.get_cached(&key).map(|s| s.to_string());
+        }
+
         let now = SystemTime::now();
         sessions.sort_by(|a, b| {
             let a_ts = a.last_activity_unix_s.unwrap_or(i64::MIN);
@@ -99,17 +130,21 @@ impl Collector {
             generated_at_unix_s: system_time_to_unix_s(now).unwrap_or(0),
             host: host_list.join(","),
             sessions,
-            host_errors: if host_errors.is_empty() {
-                None
-            } else {
-                Some(host_errors)
-            },
-            warnings: if warnings.is_empty() {
-                None
-            } else {
-                Some(warnings)
-            },
+            host_errors: Some(host_errors),
+            warnings: Some(warnings),
         })
+    }
+
+    pub fn set_session_name(
+        &mut self,
+        key: SessionNameKey,
+        name: String,
+    ) -> anyhow::Result<Option<String>> {
+        self.names.set(key, name)
+    }
+
+    pub fn clear_session_name(&mut self, key: SessionNameKey) -> anyhow::Result<()> {
+        self.names.clear(key)
     }
 
     fn collect_local_rows(
@@ -195,6 +230,7 @@ impl Collector {
             pids: b.pids.clone(),
             tty: b.tty.clone(),
             title: None,
+            name: None,
             cwd: None,
             repo_root: None,
             git_branch: None,
@@ -302,7 +338,12 @@ impl Collector {
         }
         row.last_activity_unix_s = last_activity.and_then(system_time_to_unix_s);
 
-        row.status = classify_status(now, last_activity, &mut dbg);
+        let pending_call = b
+            .rollout_path
+            .as_ref()
+            .and_then(|p| self.pending_function_call_hint(p.as_path(), last_activity, &mut dbg));
+
+        row.status = classify_status(now, last_activity, pending_call.as_ref(), &mut dbg);
 
         if debug {
             row.debug = Some(dbg);
@@ -342,13 +383,65 @@ impl Collector {
             .with_context(|| format!("parse remote JSON snapshot from host={host}"))?;
         Ok(snap)
     }
+
+    fn pending_function_call_hint(
+        &mut self,
+        rollout_path: &std::path::Path,
+        mtime: Option<SystemTime>,
+        dbg: &mut SessionDebug,
+    ) -> Option<PendingFunctionCall> {
+        let entry = self
+            .rollout_tail_cache
+            .entry(rollout_path.to_path_buf())
+            .or_insert_with(|| TailCacheEntry {
+                mtime: None,
+                parsed_for_mtime: false,
+                pending_call: None,
+            });
+
+        if entry.mtime != mtime {
+            entry.mtime = mtime;
+            entry.parsed_for_mtime = false;
+            entry.pending_call = None;
+            return None;
+        }
+
+        if !entry.parsed_for_mtime {
+            entry.parsed_for_mtime = true;
+            entry.pending_call =
+                match read_pending_function_call_from_tail(rollout_path, ROLLOUT_TAIL_MAX_BYTES) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Tail parsing is best-effort; fall back to mtime heuristics.
+                        dbg.status_reason = Some(format!("tail parse failed: {e}"));
+                        None
+                    }
+                };
+        }
+
+        entry.pending_call.clone()
+    }
 }
 
 fn classify_status(
     now: SystemTime,
     last_activity: Option<SystemTime>,
+    pending_call: Option<&PendingFunctionCall>,
     dbg: &mut SessionDebug,
 ) -> SessionStatus {
+    if let Some(call) = pending_call {
+        if call.name == "request_user_input" {
+            dbg.status_reason = Some(format!("waiting for user input (call_id={})", call.call_id));
+            return SessionStatus::Waiting;
+        }
+
+        dbg.status_reason = Some(format!(
+            "pending tool call: {} (call_id={})",
+            call.name, call.call_id
+        ));
+        return SessionStatus::Working;
+    }
+
     // If we can't even get last activity, stay unknown (fail-loud).
     let Some(ts) = last_activity else {
         dbg.status_reason = Some("no rollout mtime".into());
@@ -376,8 +469,8 @@ fn classify_status(
         return SessionStatus::Working;
     }
 
-    // Rollouts do not persist all lifecycle events, so "waiting" is a heuristic.
-    // Be conservative: call it Unknown for a while before committing to WAIT.
+    // Rollouts do not persist all lifecycle events (e.g. TurnStarted/TurnComplete, RequestUserInput),
+    // so even with tail hints we keep an mtime-based fallback that biases toward Unknown.
     if age <= Duration::from_secs(STATUS_UNCERTAIN_MAX_AGE_SECS) {
         dbg.status_reason = Some(format!(
             "uncertain (no rollout writes for {}s)",
@@ -410,7 +503,7 @@ mod tests {
     fn classify_status_unknown_when_no_activity_time() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
         let mut dbg = blank_dbg();
-        let status = classify_status(now, None, &mut dbg);
+        let status = classify_status(now, None, None, &mut dbg);
         assert!(matches!(status, SessionStatus::Unknown));
         assert_eq!(dbg.status_reason.as_deref(), Some("no rollout mtime"));
     }
@@ -420,7 +513,7 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
         let last = now + Duration::from_secs(1);
         let mut dbg = blank_dbg();
-        let status = classify_status(now, Some(last), &mut dbg);
+        let status = classify_status(now, Some(last), None, &mut dbg);
         assert!(matches!(status, SessionStatus::Working));
     }
 
@@ -429,7 +522,7 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
         let last = now + Duration::from_secs(STATUS_MAX_FUTURE_MTIME_SKEW_SECS + 5);
         let mut dbg = blank_dbg();
-        let status = classify_status(now, Some(last), &mut dbg);
+        let status = classify_status(now, Some(last), None, &mut dbg);
         assert!(matches!(status, SessionStatus::Unknown));
         assert_eq!(
             dbg.status_reason.as_deref(),
@@ -442,7 +535,7 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
         let last = now - Duration::from_secs(10);
         let mut dbg = blank_dbg();
-        let status = classify_status(now, Some(last), &mut dbg);
+        let status = classify_status(now, Some(last), None, &mut dbg);
         assert!(matches!(status, SessionStatus::Working));
     }
 
@@ -451,7 +544,7 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
         let last = now - Duration::from_secs(30);
         let mut dbg = blank_dbg();
-        let status = classify_status(now, Some(last), &mut dbg);
+        let status = classify_status(now, Some(last), None, &mut dbg);
         assert!(matches!(status, SessionStatus::Unknown));
     }
 
@@ -460,7 +553,41 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
         let last = now - Duration::from_secs(STATUS_UNCERTAIN_MAX_AGE_SECS + 1);
         let mut dbg = blank_dbg();
-        let status = classify_status(now, Some(last), &mut dbg);
+        let status = classify_status(now, Some(last), None, &mut dbg);
         assert!(matches!(status, SessionStatus::Waiting));
+    }
+
+    #[test]
+    fn classify_status_waiting_when_pending_user_input_call() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let last = now - Duration::from_secs(5);
+        let mut dbg = blank_dbg();
+        let pending = PendingFunctionCall {
+            call_id: "call_ui".into(),
+            name: "request_user_input".into(),
+        };
+        let status = classify_status(now, Some(last), Some(&pending), &mut dbg);
+        assert!(matches!(status, SessionStatus::Waiting));
+        assert_eq!(
+            dbg.status_reason.as_deref(),
+            Some("waiting for user input (call_id=call_ui)")
+        );
+    }
+
+    #[test]
+    fn classify_status_working_when_pending_tool_call() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let last = now - Duration::from_secs(STATUS_UNCERTAIN_MAX_AGE_SECS + 10);
+        let mut dbg = blank_dbg();
+        let pending = PendingFunctionCall {
+            call_id: "call_exec".into(),
+            name: "exec_command".into(),
+        };
+        let status = classify_status(now, Some(last), Some(&pending), &mut dbg);
+        assert!(matches!(status, SessionStatus::Working));
+        assert_eq!(
+            dbg.status_reason.as_deref(),
+            Some("pending tool call: exec_command (call_id=call_exec)")
+        );
     }
 }

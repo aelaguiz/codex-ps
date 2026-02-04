@@ -4,6 +4,7 @@ mod collector;
 mod discovery;
 mod git;
 mod model;
+mod names;
 mod rollout;
 mod titles;
 mod util;
@@ -68,7 +69,7 @@ fn main() -> anyhow::Result<()> {
         cli.ssh_bin.clone(),
         cli.remote_bin.clone(),
         std::time::Duration::from_millis(cli.ssh_timeout_ms.max(100)),
-    );
+    )?;
 
     if cli.json {
         let snapshot = collector.collect(&hosts, cli.debug)?;

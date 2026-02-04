@@ -19,7 +19,7 @@ related:
 - **Plan:** Phase 1 local read-only dashboard → Phase 2 remote (SSH) discovery → Phase 3 interactive controls (Kitty remote control) and workflows.
 - **Non-negotiables:**
   - Read-only and safe by default (no sending input/killing sessions in the MVP).
-  - Fail-loud: unknown fields must be explicitly labeled `unknown` (optionally with a reason).
+  - Fail-loud: the TUI uses `unknown` placeholders (and `--debug` explains why); JSON uses `null` for unknown optional fields and always includes `host_errors[]` / `warnings[]` (possibly empty) rather than silently dropping rows.
   - Fast refresh with bounded work per tick (no UI stalls; timeouts on slow probes).
   - Works with “messy reality” (sessions appearing/disappearing; partial metadata; non-git directories).
   - Extensible: collectors (data) and renderers (TUI/JSON) are decoupled for future controls.
@@ -46,18 +46,19 @@ Manual QA: pending (non-blocking)
 - Manual QA (remote): ensure `codex-ps` exists on PATH for `home` and `amirs-work-studio`; run `--host all` with one host unreachable and confirm `host_errors[]` is shown.
 
 ## External second opinions
-- Opus: received
+- Opus: received (2026-02-04)
   - Key points:
-    - `--debug` isn’t surfaced in the TUI (only styling); expose reasons to match the “fail-loud” intent.
-    - Spec mentions tail scan + session_index fallback; make sure doc/code agree (defer vs implement).
-    - Consider whether “stale vs disappears” should be an explicit state.
-  - Disposition: accepted — aligns with the plan’s trust/fail-loud goals; tail scan/session_index are treated as doc drift to resolve explicitly.
-- Gemini: received
+    - SSOT and boundaries look correct: thread id is primary; rollout parsing is centralized; grouping is done via `subagent_parent_thread_id`.
+    - Diagnostics are present and useful in `--debug` (e.g., status reason via the `WHY` column).
+    - JSON contract should be stable for scripting: prefer emitting `null` for unknown optional fields (and empty arrays for `host_errors[]`/`warnings[]`) over omitting keys.
+    - Minor drift: `session_meta.id` mismatch is only surfaced in debug (not a top-level field).
+  - Disposition: accepted — implemented “stable JSON nulls/arrays” and kept `meta_id_mismatch` as debug-only (non-blocking).
+- Gemini: received (2026-02-04)
   - Key points:
-    - Missing tail parsing and some session_meta fields (e.g., source/model_provider) relative to the “code-as-spec” discussion.
-    - State classification semantics need to be transparent to users (diagnostics).
-    - Remote aggregation should expose failures clearly.
-  - Disposition: partially accepted — agree on diagnostics + doc/code alignment; tail parsing is still deferred for MVP because `lsof cwd` is the primary “current pwd” SSOT.
+    - Phase 1 + 2 implementation appears complete: grouping, lineage parsing, and SSH aggregation match the plan.
+    - JSON schema nuance: make sure unknown optional fields are emitted as `null` (not missing keys) for easier scripting; TUI is fail-loud via `"unknown"` placeholders.
+    - Local discovery timeout is bounded but hardcoded (10s) vs being a CLI-exposed knob.
+  - Disposition: accepted — implemented stable JSON nulls/arrays; kept bounded-but-hardcoded local timeout as follow-up.
 <!-- arch_skill:block:implementation_audit:end -->
 
 <!-- arch_skill:block:planning_passes:start -->
@@ -104,16 +105,16 @@ note: This is a warn-first checklist only. It should not hard-block execution.
   - Host, PID (or stable session identifier), cwd/pwd, repo root/worktree, branch (if applicable), and a state label.
   - A “last update” and/or “last activity” timestamp to help spot stuck sessions.
 - The view refreshes automatically and stays responsive even when some sessions disappear mid-refresh.
-- Unknown fields are shown as `unknown` (not blank) and do not crash the tool.
+- Unknown fields are fail-loud (TUI shows `unknown`, JSON uses `null`) and do not crash the tool.
 - Evidence plan (common-sense; non-blocking):
   - Primary signal (keep it minimal; prefer existing tests/checks): manual QA on a host with 2–5 concurrent Codex sessions — confirm the rows match reality by checking the underlying terminal tabs and `pwd`/branch.
   - Optional second signal (only if needed): compare discovered PIDs/paths against `ps`/`lsof` on the same host — confirm no phantom sessions.
 - Metrics / thresholds (if relevant):
-  - Refresh latency: < 250ms typical on local host — measured via self-reported tick timing in a `--debug` mode.
+  - Refresh latency: target < 250ms typical on local host (kept snappy via bounded probes/timeouts; we don’t currently render per-tick timing in the UI).
 
 ## 0.5 Key invariants (fix immediately if violated)
 - No silent fallbacks: if a value can’t be derived, emit `unknown` and keep rendering.
-- Prefer live truth over stale files: if process is gone, the session should disappear quickly (or be marked “stale” explicitly).
+- Prefer live truth over stale files: if process is gone, the session should disappear quickly (MVP behavior; no explicit `stale` state).
 - Bounded work per refresh: all probes must be time-limited to keep the UI snappy.
 - Read-only by default: this tool must never write into `~/.codex` or send keystrokes in Phase 1.
 
@@ -383,18 +384,17 @@ codex-ps/
 
 * Flow A (local; MVP):
   * Resolve `CODEX_HOME` (same rule as Codex: `CODEX_HOME` env else `~/.codex`).
-  * Discover candidate `codex` processes via `ps` (filter on cmdline) and map PID → open rollout paths:
-    * preferred: `lsof -p <pid>` and filter `CODEX_HOME/sessions/**/rollout-*.jsonl`
-    * fallback: platform-specific fd scanning (Linux `/proc/<pid>/fd`, etc.)
+  * Discover active `codex` CLI processes via a **single** `lsof -c codex -F pfn` pass:
+    * per-PID `cwd` (OS truth, fd=`cwd`)
+    * open `CODEX_HOME/**/rollout-*.jsonl` paths (thread id from filename suffix)
+    * ignore Codex desktop app sessions (Electron) to keep this dashboard focused on CLI
   * Normalize to SessionId = `ThreadId` (from rollout filename or `session_meta.payload.id`).
   * For each active thread id:
-    * Read the rollout **head** (first line) for `SessionMetaLine` (id, source, model_provider, initial cwd, git branch/sha).
-    * Read the rollout **tail** (bounded chunk) to extract:
-      * latest `TurnContextItem.cwd` (for “current pwd”)
-      * latest timestamps / last item kinds (for activity classification)
+    * Read the rollout **head** (first line) for `SessionMetaLine` (id, source/lineage, initial cwd, git branch/sha).
+    * NOTE: rollout tail scanning is intentionally deferred for MVP; “current pwd” is derived from `lsof cwd` when available.
   * Optionally enrich rows:
-    * thread title via `~/.codex/.codex-global-state.json` and/or `session_index.jsonl`
-    * live repo root/branch via bounded `git -C <cwd> ...` (cache + timeout)
+    * thread title via `~/.codex/.codex-global-state.json` (MVP); `session_index.jsonl` fallback deferred
+    * repo root via bounded `git -C <cwd> rev-parse --show-toplevel` (cache + timeout); branch is best-effort from `session_meta`
   * Render to TUI; repeat on tick.
 
 * Flow B (`--json`):
@@ -407,30 +407,32 @@ codex-ps/
 
 ## 5.3 Object model + abstractions (future)
 
-* New types/modules (our SSOT):
-  * `HostId` / `HostSpec` — `{local, ssh(alias)}`.
-  * `ProcessInfo` — `{pid, ppid, tty?, state, etime, cmdline}` (for UX + classification).
+* New types/modules (our SSOT) — MVP reality (implemented):
   * `ThreadId` (string UUID) — SSOT identity; never use PID as the primary key.
-  * `ThreadLineage` — `{source: SessionSource, forked_from_id?, subagent_parent_thread_id?, subagent_depth?}`:
-    - Used to collapse spawned subagents under the “root” thread id for the overview.
-  * `RolloutHeadMeta` — parsed from `SessionMetaLine` (id, source, model_provider, git_branch/sha, created_at).
-  * `RolloutTailMeta` — parsed from bounded tail scan (last_turn_cwd, last_item_kinds, last_append_timestamp).
-  * `SessionRow` — the rendered view model for one thread id on one host (raw view).
-  * `SessionGroupRow` — a grouped view model for the TUI: one row per “root” thread id, with `subagents: {total, working, waiting, unknown}`.
-  * `SessionState` — `Working | Waiting | Unknown | Stale` (with `reason` for debug).
+  * `Snapshot` — top-level `--json` output (sessions + host_errors + warnings).
+  * `SessionRow` — one row per thread id on one host (raw view; JSON-friendly).
+  * `SessionStatus` — `working | unknown | waiting` (**no `stale` state** in MVP; sessions disappear when the process no longer holds a rollout open).
+  * `SessionDebug` — optional diagnostics (only emitted when `--debug`).
+  * `CodexLsofProcess` — raw process + fd view from `lsof` (pid, cwd, tty, open rollout paths).
+  * Lineage fields live directly on `SessionRow`:
+    * `session_source`, `forked_from_id`, `subagent_parent_thread_id`, `subagent_depth`.
+  * Grouping is a TUI-only display layer:
+    * One row per root thread id, with `SUB` summary (and optional W/U/WT breakdown in debug).
+  * Deferred (explicitly not in MVP):
+    * rollout tail scanning (`TurnContextItem.cwd`, last-item kinds) and any `RolloutTailMeta` helper.
 
 * Explicit contracts:
   * **Collector contract:** collectors never panic on bad input; they return `unknown` plus reason.
-  * **State contract:** “Waiting” means “process is alive but no recent rollout writes”; “Working” means “recent rollout writes or an unfinished tool call inferred from tail”.
-  * **Title contract:** a title is best-effort; resolver order is explicit and deterministic (global state → session_index → fallback to cwd basename → `unknown`).
+  * **State contract:** “Working” means “recent rollout writes”; “Waiting” means “no rollout writes for a while”; “Unknown” is used conservatively when evidence is insufficient (and the reason is visible in `--debug`).
+  * **Title contract:** a title is best-effort; resolver order is explicit and deterministic (global state → fallback to cwd basename → `unknown`). `session_index.jsonl` fallback is deferred.
   * **Grouping contract:** the default TUI view shows **one row per root thread id**; spawned subagents (per `SessionMeta.source.subagent.thread_spawn.parent_thread_id`) are collapsed into a `subagents=N` summary, with an optional “details” view in debug/Phase 3.
 
 * Public APIs (new/changed):
-  * `collect::process::list_codex_processes(host) -> Vec<ProcessInfo>`
-  * `collect::process::map_processes_to_rollouts(host, codex_home) -> HashMap<ThreadId, Vec<ProcessInfo>>`
-  * `collect::rollout::read_head_meta(path) -> RolloutHeadMeta`
-  * `collect::rollout::read_tail_meta(path) -> RolloutTailMeta`
-  * `classify::classify_session(head, tail, processes) -> SessionState`
+  * `src/discovery.rs` — `lsof_codex_processes(codex_home, timeout) -> Vec<CodexLsofProcess>`
+  * `src/discovery.rs` — `extract_thread_id_from_rollout_path(path) -> Option<ThreadId>`
+  * `src/rollout.rs` — `read_session_meta(path) -> SessionMeta` (head-only)
+  * `src/collector.rs` — `Collector::collect(hosts, debug) -> Snapshot`
+  * `src/app.rs` — `run_tui(collector, hosts, refresh_ms, debug)`
 
 ## 5.4 Invariants and boundaries
 
@@ -440,7 +442,7 @@ codex-ps/
   * `ThreadId` is the primary key; PID is always secondary display/diagnostic.
   * Rollout parsing is centralized in one module (no duplicated ad-hoc JSON parsing in renderers).
 * Determinism contracts (time/randomness):
-  * Any “active within N seconds” threshold is a constant with a single definition and is surfaced in `--debug`.
+  * Any “active within N seconds” threshold is a constant with a single definition (centralized in the collector); debug output surfaces the observed “age” so the heuristic is interpretable.
 * Performance / allocation boundaries:
   * Bounded read sizes for rollouts (head = 1 line; tail = <= 256–512KB).
   * Git probes are cached + time-bounded; never block the UI tick on slow repos.
@@ -475,10 +477,10 @@ Keys (later):  Enter expand row   d details   q quit   r refresh
 | Area | File | Symbol / Call site | Current behavior | Required change | Why | New API / contract | Tests impacted |
 | ---- | ---- | ------------------ | ---------------- | --------------- | --- | ------------------ | -------------- |
 | Upstream session identity | `/Users/aelaguiz/workspace/openai-codex/codex-rs/core/src/rollout/recorder.rs` | `create_log_file()` / `rollout_writer()` | Codex writes `rollout-...-<thread_id>.jsonl` and keeps it open while running | **No upstream change**; treat filename + first line as contract | Our observer needs a stable identity | `ThreadId` derived from rollout path and/or `session_meta.payload.id` | Unit tests for filename/thread id parsing |
-| Subagent lineage + grouping | `/Users/aelaguiz/workspace/openai-codex/codex-rs/protocol/src/protocol.rs` + `/Users/aelaguiz/workspace/openai-codex/codex-rs/core/src/tools/handlers/collab.rs` | `SessionMeta.source` / `SubAgentSource::ThreadSpawn{parent_thread_id,depth}` / collab `spawn_agent` | Spawned subagents are separate threads (separate rollouts) with an explicit parent pointer in session meta | Parse `source` from `session_meta` head and compute `root_thread_id`; group the TUI to show one row per root + `subagents=N` | Prevent row explosion; make the overview reflect “one session with helpers” | `SessionLineage { source, subagent_parent_thread_id?, depth? }` + `group_by_root(rows) -> group_rows` | Unit tests for source parsing + grouping correctness |
+| Subagent lineage + grouping | `/Users/aelaguiz/workspace/openai-codex/codex-rs/protocol/src/protocol.rs` + `/Users/aelaguiz/workspace/openai-codex/codex-rs/core/src/tools/handlers/collab.rs` | `SessionMeta.source` / `SubAgentSource::ThreadSpawn{parent_thread_id,depth}` / collab `spawn_agent` | Spawned subagents are separate threads (separate rollouts) with an explicit parent pointer in session meta | Parse `source` from `session_meta` head and compute `root_thread_id`; group the TUI to show one row per root + `subagents=N` | Prevent row explosion; make the overview reflect “one session with helpers” | `SessionLineage { source, subagent_parent_thread_id?, depth? }` + `group_by_root(rows) -> group_rows` | Unit tests for source parsing (grouping exercised via TUI/manual QA) |
 | Upstream JSONL schema | `/Users/aelaguiz/workspace/openai-codex/codex-rs/protocol/src/protocol.rs` | `SessionMetaLine` (first JSONL record) | Defines `type=session_meta` and payload shape | MVP: parse only `id`/`cwd`/`git` from the first line; tolerate huge first line | We only need a few fields for the dashboard; keep parsing bounded | `src/rollout.rs` — `read_session_meta(path) -> SessionMeta` | Unit tests for session_meta parsing |
-| Persisted vs non-persisted events | `/Users/aelaguiz/workspace/openai-codex/codex-rs/core/src/rollout/policy.rs` | `should_persist_event_msg` | Some lifecycle events are not persisted in rollouts | Classify state from what’s actually persisted (mtime heuristic) and fail-loud when ambiguous | Prevent false “waiting” certainty | `src/collector.rs` — `classify_status(...) -> SessionStatus` + `debug.status_reason` | (Missing) add unit tests for classifier edge cases |
-| Thread title resolution | `~/.codex/.codex-global-state.json` | `thread-titles` map | Titles exist in global state (when available) | MVP: global-state titles → fallback to cwd basename → `unknown` (explicit source in debug); **defer** `session_index.jsonl` fallback | Make dashboard glanceable without blocking on extra files | `src/titles.rs` — `TitleResolver::get_title(thread_id)` | Unit tests for resolver precedence; add “stale cache” regression |
+| Persisted vs non-persisted events | `/Users/aelaguiz/workspace/openai-codex/codex-rs/core/src/rollout/policy.rs` | `should_persist_event_msg` | Some lifecycle events are not persisted in rollouts | Classify state from what’s actually persisted (mtime heuristic) and fail-loud when ambiguous | Prevent false “waiting” certainty | `src/collector.rs` — `classify_status(...) -> SessionStatus` + `debug.status_reason` | Unit tests cover classifier thresholds + future-mtime skew |
+| Thread title resolution | `~/.codex/.codex-global-state.json` | `thread-titles` map | Titles exist in global state (when available) | MVP: global-state titles → fallback to cwd basename → `unknown` (explicit source in debug); **defer** `session_index.jsonl` fallback | Make dashboard glanceable without blocking on extra files | `src/titles.rs` — `TitleResolver::get_title(thread_id)` | Unit tests cover resolver behavior (incl “stale cache” regression) |
 | “Current pwd” (not just initial) | OS truth (`lsof`) + rollout head fallback | `lsof` `cwd` fd / `session_meta.cwd` | Current cwd is available via OS; rollouts contain only “start cwd” unless tail-scanned | MVP: use `lsof` cwd; fallback to `session_meta.cwd`; **defer** tail scan | Accurate “pwd” even after `cd`, without reading huge tail lines | `src/collector.rs` (cwd preference) | Unit tests for preference order are optional |
 | Git context | `git` + rollout head | `git rev-parse --show-toplevel`, `SessionMeta.git` | Git branch/sha captured once at session start; repo root can be probed | Use session_meta for branch/sha; probe repo root with a short timeout and cache | Branch/worktree is a key column | `src/git.rs` — `GitCache::repo_root(...)` | Optional tests; keep manual QA as primary |
 | Active session discovery | OS (`lsof`) | `lsof -c codex -F pfn` | No “list active sessions” API | Map PID → open rollout file(s) → thread id (SSOT) | Establish session existence + PID/TTY/cwd | `src/discovery.rs` — `lsof_codex_processes(...)` | Integration tests optional; unit tests cover filename parsing |
@@ -531,26 +533,26 @@ Keys (later):  Enter expand row   d details   q quit   r refresh
       * also parse `session_meta.source` (only for lineage/grouping; do not over-parse the full meta blob).
     * Title resolution: deterministic precedence `~/.codex/.codex-global-state.json` → cwd basename → `(unknown)`.
   * State classification (fail-loud):
-    * `WORK` when there are recent rollout appends (mtime <= 10s).
-    * `WAIT` when process is alive but no recent rollout appends.
-    * `?` when evidence is insufficient (explicit reason in `--debug`/JSON).
+    * `WORK` when there are recent rollout appends (mtime age <= 15s; tolerates tiny future skew).
+    * `UNK` when evidence is insufficient (including a conservative “uncertain” window before committing to `WAIT`; reason is visible in `--debug`).
+    * `WAIT` when the process is alive but there have been no rollout appends for a while (mtime age > 60s).
   * TUI:
     * Stable columns (HOST, PID, TID, SUB, STATE, AGE, TITLE, BRANCH, PWD), deterministic sort, refresh tick.
     * PWD is shortened for display by stripping `$HOME` (so `/Users/aelaguiz/...` becomes `~/...`).
     * Default view is grouped: one row per root thread id, with `SUB` showing spawned subagent count.
     * Collector runs in a background thread so the UI stays responsive even when `lsof` is slow.
-* Verification (smallest signal):
+  * Verification (smallest signal):
   * Programmatic:
     * `cargo test` (unit tests around parsing + classification + title resolver precedence).
     * `cargo fmt --check` and `cargo clippy` (keep it clean early).
-    * `codex-ps --json` produces valid JSON and never crashes when rollouts contain huge first lines.
+    * `codex-ps --json` produces valid JSON; spot-check on a real session with a large `session_meta` first line (e.g., large `base_instructions`) to confirm it doesn’t crash.
   * Manual (short checklist, not a harness):
     * With 2–5 running Codex sessions, confirm row count and a couple of rows against `ps` + `lsof`.
     * Spawn a subagent (e.g. via `spawn_agent`) and confirm:
       * the table does **not** add a new top-level row; instead the parent row shows `SUB` incrementing.
-    * Kill a session while `codex-ps` is running; confirm no crash and row disappears or becomes `stale`.
+    * Kill a session while `codex-ps` is running; confirm no crash and the row disappears on the next refresh (MVP behavior; no explicit `stale` state).
 * Docs/comments (propagation; only if needed):
-  * One SSOT comment in the `SessionState` boundary explaining why “waiting” is heuristic (rollout persistence policy).
+  * One SSOT comment in the `SessionStatus` / `classify_status` boundary explaining why “waiting” is heuristic (rollout persistence policy).
 * Exit criteria:
   * TUI shows one row per active **root** thread id (not per PID); spawned subagents are summarized in `SUB`.
   * `--json` includes one row per active thread id (root + subagents), including lineage fields for grouping.
