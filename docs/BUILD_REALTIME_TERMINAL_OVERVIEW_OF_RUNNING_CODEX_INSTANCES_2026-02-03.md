@@ -357,28 +357,26 @@ Why this is the default:
 
 Non-default alternative (kept as fallback, not MVP): **Python + Textual** for maximum UI polish, but heavier packaging/remote story.
 
-Proposed layout in this repo:
+Layout in this repo (current):
 ```text
-utils/
+codex-ps/
+  Cargo.toml
+  Cargo.lock
+  README.md
   docs/
     BUILD_REALTIME_TERMINAL_OVERVIEW_OF_RUNNING_CODEX_INSTANCES_2026-02-03.md
-  codex-ps/                                 # new terminal utility (read-only observer)
-    Cargo.toml
-    src/
-      main.rs                               # CLI args + refresh loop orchestration
-      model.rs                              # SessionRow / SessionState (SSOT types)
-      codex_home.rs                         # CODEX_HOME resolution (env + default)
-      collect/
-        process.rs                          # process discovery (ps) + open-file mapping (lsof/procfd)
-        rollout.rs                          # bounded JSONL parser (session_meta + tail summary)
-        titles.rs                           # thread title resolution (global-state + session_index)
-        git.rs                              # optional git probes (bounded + cached)
-        host.rs                             # local vs ssh runner abstraction
-      classify.rs                           # working/waiting/unknown classification logic
-      render/
-        tui.rs                              # interactive auto-updating table (ratatui)
-        json.rs                             # `--json` snapshot output
-      cache.rs                              # per-tick caching + throttling (git + file reads)
+    BUILD_REALTIME_TERMINAL_OVERVIEW_OF_RUNNING_CODEX_INSTANCES_2026-02-03_WORKLOG.md
+  src/
+    main.rs                                 # CLI args + orchestration
+    app.rs                                  # Ratatui TUI renderer
+    collector.rs                            # collect + enrich + classify + group
+    codex_home.rs                           # CODEX_HOME resolution
+    discovery.rs                             # active codex discovery (lsof)
+    rollout.rs                              # bounded JSONL parsing (session_meta) + lineage
+    titles.rs                               # title resolution + cache
+    git.rs                                  # git probes (bounded + cached)
+    model.rs                                # SessionRow SSOT + JSON schema
+    util.rs                                 # small helpers
 ```
 
 ## 5.2 Control paths (future)
@@ -478,14 +476,14 @@ Keys (later):  Enter expand row   d details   q quit   r refresh
 | ---- | ---- | ------------------ | ---------------- | --------------- | --- | ------------------ | -------------- |
 | Upstream session identity | `/Users/aelaguiz/workspace/openai-codex/codex-rs/core/src/rollout/recorder.rs` | `create_log_file()` / `rollout_writer()` | Codex writes `rollout-...-<thread_id>.jsonl` and keeps it open while running | **No upstream change**; treat filename + first line as contract | Our observer needs a stable identity | `ThreadId` derived from rollout path and/or `session_meta.payload.id` | Unit tests for filename/thread id parsing |
 | Subagent lineage + grouping | `/Users/aelaguiz/workspace/openai-codex/codex-rs/protocol/src/protocol.rs` + `/Users/aelaguiz/workspace/openai-codex/codex-rs/core/src/tools/handlers/collab.rs` | `SessionMeta.source` / `SubAgentSource::ThreadSpawn{parent_thread_id,depth}` / collab `spawn_agent` | Spawned subagents are separate threads (separate rollouts) with an explicit parent pointer in session meta | Parse `source` from `session_meta` head and compute `root_thread_id`; group the TUI to show one row per root + `subagents=N` | Prevent row explosion; make the overview reflect “one session with helpers” | `SessionLineage { source, subagent_parent_thread_id?, depth? }` + `group_by_root(rows) -> group_rows` | Unit tests for source parsing + grouping correctness |
-| Upstream JSONL schema | `/Users/aelaguiz/workspace/openai-codex/codex-rs/protocol/src/protocol.rs` | `SessionMetaLine` (first JSONL record) | Defines `type=session_meta` and payload shape | MVP: parse only `id`/`cwd`/`git` from the first line; tolerate huge first line | We only need a few fields for the dashboard; keep parsing bounded | `codex-ps/src/rollout.rs` — `read_session_meta(path) -> SessionMeta` | Unit tests for session_meta parsing |
-| Persisted vs non-persisted events | `/Users/aelaguiz/workspace/openai-codex/codex-rs/core/src/rollout/policy.rs` | `should_persist_event_msg` | Some lifecycle events are not persisted in rollouts | Classify state from what’s actually persisted (mtime heuristic) and fail-loud when ambiguous | Prevent false “waiting” certainty | `codex-ps/src/collector.rs` — `classify_status(...) -> SessionStatus` + `debug.status_reason` | (Missing) add unit tests for classifier edge cases |
-| Thread title resolution | `~/.codex/.codex-global-state.json` | `thread-titles` map | Titles exist in global state (when available) | MVP: global-state titles → fallback to cwd basename → `unknown` (explicit source in debug); **defer** `session_index.jsonl` fallback | Make dashboard glanceable without blocking on extra files | `codex-ps/src/titles.rs` — `TitleResolver::get_title(thread_id)` | Unit tests for resolver precedence; add “stale cache” regression |
-| “Current pwd” (not just initial) | OS truth (`lsof`) + rollout head fallback | `lsof` `cwd` fd / `session_meta.cwd` | Current cwd is available via OS; rollouts contain only “start cwd” unless tail-scanned | MVP: use `lsof` cwd; fallback to `session_meta.cwd`; **defer** tail scan | Accurate “pwd” even after `cd`, without reading huge tail lines | `codex-ps/src/collector.rs` (cwd preference) | Unit tests for preference order are optional |
-| Git context | `git` + rollout head | `git rev-parse --show-toplevel`, `SessionMeta.git` | Git branch/sha captured once at session start; repo root can be probed | Use session_meta for branch/sha; probe repo root with a short timeout and cache | Branch/worktree is a key column | `codex-ps/src/git.rs` — `GitCache::repo_root(...)` | Optional tests; keep manual QA as primary |
-| Active session discovery | OS (`lsof`) | `lsof -c codex -F pfn` | No “list active sessions” API | Map PID → open rollout file(s) → thread id (SSOT) | Establish session existence + PID/TTY/cwd | `codex-ps/src/discovery.rs` — `lsof_codex_processes(...)` | Integration tests optional; unit tests cover filename parsing |
-| Remote hosts | `ssh` | `ssh <alias> codex-ps --json` | Manual today | Phase 2: ask remote to run `codex-ps --json` and merge; timeouts + `host_errors[]` | Single dashboard across boxes | `codex-ps/src/collector.rs` — `collect_remote_host(...)` + `host_errors` | Manual verification (remote); local tests only |
-| Renderer | `codex-ps/src/app.rs` | TUI refresh loop | N/A | Stable columns + background collector thread; refresh tick | Glanceable UI | `codex-ps/src/app.rs` — `run_tui(...)` | Manual QA; add debug/identity UX tests only if cheap |
+| Upstream JSONL schema | `/Users/aelaguiz/workspace/openai-codex/codex-rs/protocol/src/protocol.rs` | `SessionMetaLine` (first JSONL record) | Defines `type=session_meta` and payload shape | MVP: parse only `id`/`cwd`/`git` from the first line; tolerate huge first line | We only need a few fields for the dashboard; keep parsing bounded | `src/rollout.rs` — `read_session_meta(path) -> SessionMeta` | Unit tests for session_meta parsing |
+| Persisted vs non-persisted events | `/Users/aelaguiz/workspace/openai-codex/codex-rs/core/src/rollout/policy.rs` | `should_persist_event_msg` | Some lifecycle events are not persisted in rollouts | Classify state from what’s actually persisted (mtime heuristic) and fail-loud when ambiguous | Prevent false “waiting” certainty | `src/collector.rs` — `classify_status(...) -> SessionStatus` + `debug.status_reason` | (Missing) add unit tests for classifier edge cases |
+| Thread title resolution | `~/.codex/.codex-global-state.json` | `thread-titles` map | Titles exist in global state (when available) | MVP: global-state titles → fallback to cwd basename → `unknown` (explicit source in debug); **defer** `session_index.jsonl` fallback | Make dashboard glanceable without blocking on extra files | `src/titles.rs` — `TitleResolver::get_title(thread_id)` | Unit tests for resolver precedence; add “stale cache” regression |
+| “Current pwd” (not just initial) | OS truth (`lsof`) + rollout head fallback | `lsof` `cwd` fd / `session_meta.cwd` | Current cwd is available via OS; rollouts contain only “start cwd” unless tail-scanned | MVP: use `lsof` cwd; fallback to `session_meta.cwd`; **defer** tail scan | Accurate “pwd” even after `cd`, without reading huge tail lines | `src/collector.rs` (cwd preference) | Unit tests for preference order are optional |
+| Git context | `git` + rollout head | `git rev-parse --show-toplevel`, `SessionMeta.git` | Git branch/sha captured once at session start; repo root can be probed | Use session_meta for branch/sha; probe repo root with a short timeout and cache | Branch/worktree is a key column | `src/git.rs` — `GitCache::repo_root(...)` | Optional tests; keep manual QA as primary |
+| Active session discovery | OS (`lsof`) | `lsof -c codex -F pfn` | No “list active sessions” API | Map PID → open rollout file(s) → thread id (SSOT) | Establish session existence + PID/TTY/cwd | `src/discovery.rs` — `lsof_codex_processes(...)` | Integration tests optional; unit tests cover filename parsing |
+| Remote hosts | `ssh` | `ssh <alias> codex-ps --json` | Manual today | Phase 2: ask remote to run `codex-ps --json` and merge; timeouts + `host_errors[]` | Single dashboard across boxes | `src/collector.rs` — `collect_remote_host(...)` + `host_errors` | Manual verification (remote); local tests only |
+| Renderer | `src/app.rs` | TUI refresh loop | N/A | Stable columns + background collector thread; refresh tick | Glanceable UI | `src/app.rs` — `run_tui(...)` | Manual QA; add debug/identity UX tests only if cheap |
 
 ## 6.2 Migration notes
 - No changes are required to Codex itself; this is an external observer.
