@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use anyhow::Context;
@@ -27,6 +28,12 @@ struct SessionMetaPayload {
 struct GitInfo {
     commit_hash: Option<String>,
     branch: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingFunctionCall {
+    pub call_id: String,
+    pub name: String,
 }
 
 pub fn read_session_meta(path: &Path) -> anyhow::Result<SessionMeta> {
@@ -63,6 +70,96 @@ pub fn read_session_meta(path: &Path) -> anyhow::Result<SessionMeta> {
         subagent_parent_thread_id,
         subagent_depth,
     })
+}
+
+pub fn read_pending_function_call_from_tail(
+    path: &Path,
+    max_bytes: u64,
+) -> anyhow::Result<Option<PendingFunctionCall>> {
+    let (start_offset, buf) = read_rollout_tail_bytes(path, max_bytes)
+        .with_context(|| format!("read rollout tail: {}", path.display()))?;
+    let text = String::from_utf8_lossy(&buf);
+
+    // If we started mid-file, drop the first partial line so we only parse full JSON objects.
+    let mut content = text.as_ref();
+    if start_offset > 0 {
+        if let Some(i) = content.find('\n') {
+            content = &content[i + 1..];
+        } else {
+            // No newline found in the tail chunk; we likely grabbed a partial mega-line.
+            // Bail out instead of guessing.
+            return Ok(None);
+        }
+    }
+
+    let mut pending: HashMap<String, String> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let Ok(line) = serde_json::from_str::<RolloutLine<serde_json::Value>>(line) else {
+            continue;
+        };
+        if line.ty != "response_item" {
+            continue;
+        }
+
+        let Some(item_type) = line.payload.get("type").and_then(|v| v.as_str()) else {
+            continue;
+        };
+
+        match item_type {
+            "function_call" => {
+                let Some(call_id) = line.payload.get("call_id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Some(name) = line.payload.get("name").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                // If a call_id appears multiple times, keep the most recent and treat it as pending.
+                pending.insert(call_id.to_string(), name.to_string());
+                order.push(call_id.to_string());
+            }
+            "function_call_output" => {
+                let Some(call_id) = line.payload.get("call_id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                pending.remove(call_id);
+            }
+            _ => {}
+        }
+    }
+
+    for call_id in order.into_iter().rev() {
+        if let Some(name) = pending.get(&call_id) {
+            return Ok(Some(PendingFunctionCall {
+                call_id,
+                name: name.clone(),
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+fn read_rollout_tail_bytes(path: &Path, max_bytes: u64) -> anyhow::Result<(u64, Vec<u8>)> {
+    let mut f = File::open(path).with_context(|| format!("open rollout: {}", path.display()))?;
+    let len = f
+        .metadata()
+        .with_context(|| format!("stat rollout: {}", path.display()))?
+        .len();
+    let start = len.saturating_sub(max_bytes);
+    f.seek(SeekFrom::Start(start))
+        .with_context(|| format!("seek rollout: {}", path.display()))?;
+
+    let mut buf: Vec<u8> = Vec::new();
+    f.read_to_end(&mut buf)
+        .with_context(|| format!("read rollout: {}", path.display()))?;
+    Ok((start, buf))
 }
 
 fn parse_session_source(
@@ -165,5 +262,66 @@ mod tests {
         let err = read_session_meta(f.path()).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("expected first line type=session_meta"));
+    }
+
+    #[test]
+    fn read_pending_function_call_from_tail_detects_pending_call() {
+        let mut f = NamedTempFile::new().expect("tempfile");
+        std::io::Write::write_all(
+            &mut f,
+            br#"{"type":"session_meta","payload":{"id":"t"}}
+{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"call1"}}
+"#,
+        )
+        .expect("write");
+
+        let pending = read_pending_function_call_from_tail(f.path(), 64 * 1024)
+            .expect("read_pending_function_call_from_tail");
+        assert_eq!(
+            pending,
+            Some(PendingFunctionCall {
+                call_id: "call1".into(),
+                name: "exec_command".into()
+            })
+        );
+    }
+
+    #[test]
+    fn read_pending_function_call_from_tail_resolves_when_output_present() {
+        let mut f = NamedTempFile::new().expect("tempfile");
+        std::io::Write::write_all(
+            &mut f,
+            br#"{"type":"session_meta","payload":{"id":"t"}}
+{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"call1"}}
+{"type":"response_item","payload":{"type":"function_call_output","call_id":"call1","output":"ok"}}
+"#,
+        )
+        .expect("write");
+
+        let pending = read_pending_function_call_from_tail(f.path(), 64 * 1024)
+            .expect("read_pending_function_call_from_tail");
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn read_pending_function_call_from_tail_detects_request_user_input_pending() {
+        let mut f = NamedTempFile::new().expect("tempfile");
+        std::io::Write::write_all(
+            &mut f,
+            br#"{"type":"session_meta","payload":{"id":"t"}}
+{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","arguments":"{}","call_id":"call_ui"}}
+"#,
+        )
+        .expect("write");
+
+        let pending = read_pending_function_call_from_tail(f.path(), 64 * 1024)
+            .expect("read_pending_function_call_from_tail");
+        assert_eq!(
+            pending,
+            Some(PendingFunctionCall {
+                call_id: "call_ui".into(),
+                name: "request_user_input".into()
+            })
+        );
     }
 }
