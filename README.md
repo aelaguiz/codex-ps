@@ -1,6 +1,6 @@
 # codex-ps
 
-`codex-ps` is a small terminal UI that gives you a real-time overview of active Codex CLI sessions:
+`codex-ps` is a small terminal UI (TUI) that gives you a real-time overview of active Codex CLI sessions:
 
 - working directory (shortened to `~/...`)
 - git branch
@@ -9,32 +9,68 @@
 
 It reads session data from `~/.codex` (or `$CODEX_HOME`).
 
-## Quickstart
+## Requirements
+
+- Rust (stable) + Cargo
+- `lsof` in `PATH` (used to discover active `codex` processes)
+- A local Codex CLI install that writes sessions under `~/.codex` (or `$CODEX_HOME`)
+
+## Install
+
+Install from GitHub:
+
+```bash
+cargo install --git https://github.com/aelaguiz/codex-ps.git
+```
+
+Or install from a local checkout:
+
+```bash
+git clone https://github.com/aelaguiz/codex-ps.git
+cd codex-ps
+cargo install --path .
+```
+
+## Quickstart / Usage
 
 Run the TUI:
 
 ```bash
-cargo run --
+codex-ps
+# or, from the repo:
+# cargo run --
 ```
 
 Print a single JSON snapshot:
 
 ```bash
-cargo run -- --json | jq .
+codex-ps --json | jq .
+# or, from the repo:
+# cargo run -- --json | jq .
 ```
 
-Install locally:
+Pick which hosts to aggregate (defaults to `local`):
 
 ```bash
-cargo install --path .
+codex-ps --host local
+codex-ps --host all
+codex-ps --host home,amirs-work-studio
 ```
 
 ## Remote aggregation (optional)
 
-If `codex-ps` is installed on the remote host(s), you can aggregate:
+If `codex-ps` is installed on the remote host(s) (and your SSH aliases work), you can aggregate:
 
 ```bash
 codex-ps --host all
 ```
 
 Defaults include `home` and `amirs-work-studio` (override with `--host`).
+
+## Development
+
+```bash
+cargo fmt
+cargo clippy -- -D warnings
+cargo test
+```

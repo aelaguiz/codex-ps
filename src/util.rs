@@ -21,25 +21,25 @@ pub fn run_cmd_with_timeout(mut cmd: Command, timeout: Duration) -> anyhow::Resu
 
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("spawn command: {:?}", cmd))?;
+        .with_context(|| format!("spawn command: {cmd:?}"))?;
 
     let status = child
         .wait_timeout(timeout)
-        .with_context(|| format!("wait_timeout for {:?}", cmd))?;
+        .with_context(|| format!("wait_timeout for {cmd:?}"))?;
 
     let status = match status {
         Some(s) => s,
         None => {
             let _ = child.kill();
             let _ = child.wait();
-            anyhow::bail!("command timed out after {timeout:?}: {:?}", cmd);
+            anyhow::bail!("command timed out after {timeout:?}: {cmd:?}");
         }
     };
 
     let stdout = std::fs::read(stdout_file.path())
-        .with_context(|| format!("read temp stdout for {:?}", cmd))?;
+        .with_context(|| format!("read temp stdout for {cmd:?}"))?;
     let stderr = std::fs::read(stderr_file.path())
-        .with_context(|| format!("read temp stderr for {:?}", cmd))?;
+        .with_context(|| format!("read temp stderr for {cmd:?}"))?;
 
     Ok(Output {
         status,
