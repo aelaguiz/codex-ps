@@ -6,6 +6,9 @@ pub struct Snapshot {
     pub generated_at_unix_s: i64,
     pub host: String,
     pub sessions: Vec<SessionRow>,
+    // JSON contract: keep these keys present (possibly empty) for scripting stability.
+    // We keep the type as Option for backwards-compatible deserialization when aggregating
+    // across hosts (older versions may omit or null these fields).
     pub host_errors: Option<Vec<HostError>>,
     pub warnings: Option<Vec<String>>,
 }
@@ -22,17 +25,15 @@ pub struct SessionRow {
     pub repo_root: Option<String>,
     pub git_branch: Option<String>,
     pub git_commit: Option<String>,
+    // JSON contract: these lineage fields intentionally serialize as `null` when unknown
+    // (do NOT add `skip_serializing_if`) so `--json` has a stable schema for scripting.
     /// Best-effort source/role hint from `session_meta.source` (e.g. "cli", "vscode", "subagent").
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub session_source: Option<String>,
     /// Best-effort lineage hint from `session_meta.forked_from_id`.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub forked_from_id: Option<String>,
     /// Present when this thread was spawned as a subagent (thread spawn) and has a parent thread id.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_parent_thread_id: Option<String>,
     /// Subagent spawn depth when present (0=root).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_depth: Option<i32>,
     pub status: SessionStatus,
     pub last_activity_unix_s: Option<i64>,

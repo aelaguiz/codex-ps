@@ -99,16 +99,8 @@ impl Collector {
             generated_at_unix_s: system_time_to_unix_s(now).unwrap_or(0),
             host: host_list.join(","),
             sessions,
-            host_errors: if host_errors.is_empty() {
-                None
-            } else {
-                Some(host_errors)
-            },
-            warnings: if warnings.is_empty() {
-                None
-            } else {
-                Some(warnings)
-            },
+            host_errors: Some(host_errors),
+            warnings: Some(warnings),
         })
     }
 

@@ -59,3 +59,17 @@ related:
   - Manual QA still pending (non-blocking): validate grouped view and `SUB` counts against real multi-agent activity.
 - Next steps:
   - Re-run remote manual validation on `home` + `amirs-work-studio` with real sessions.
+
+## Phase 1 + Phase 2 (JSON Contract Polish) Progress Update
+- Work completed:
+  - Stabilized `--json` output for scripting: unknown optional lineage fields now emit `null` instead of omitting keys, and `host_errors[]` / `warnings[]` are always present (possibly empty).
+  - Updated the plan doc’s Implementation Audit section to reflect current JSON contract and reviewer feedback dispositions.
+- Tests run + results:
+  - `cargo fmt --check` — ok
+  - `cargo test` — ok
+  - `cargo clippy -- -D warnings` — ok
+- Issues / deviations:
+  - Manual QA still pending (non-blocking): multi-session real-world validation and remote host reachability cases.
+- Next steps:
+  - Manual QA (local): 2–5 sessions, kill one mid-refresh, confirm no crash and rows update.
+  - Manual QA (remote): `--host all` with one unreachable host; confirm `host_errors[]` behavior.
