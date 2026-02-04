@@ -21,6 +21,9 @@ pub struct SessionRow {
     pub pids: Vec<i32>,
     pub tty: Option<String>,
     pub title: Option<String>,
+    // JSON contract: this is intentionally `null` when unset (do NOT add `skip_serializing_if`)
+    // so `--json` keeps a stable schema for scripting.
+    pub name: Option<String>,
     pub cwd: Option<String>,
     pub repo_root: Option<String>,
     pub git_branch: Option<String>,

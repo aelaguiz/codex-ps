@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::mpsc;
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -16,10 +16,11 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
 
 use crate::collector::Collector;
 use crate::model::{SessionRow, SessionStatus, Snapshot};
+use crate::names::SessionNameKey;
 use crate::util::truncate_middle;
 
 pub fn run_tui(
@@ -36,7 +37,7 @@ pub fn run_tui(
     let mut terminal = Terminal::new(backend).context("create terminal")?;
     terminal.clear().ok();
 
-    let (cmd_tx, cmd_rx) = mpsc::sync_channel::<WorkerCmd>(1);
+    let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
     let (msg_tx, msg_rx) = mpsc::channel::<WorkerMsg>();
 
     let worker = thread::spawn(move || worker_loop(collector, hosts, debug, cmd_rx, msg_tx));
@@ -57,15 +58,22 @@ pub fn run_tui(
     res
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum WorkerCmd {
     Refresh,
+    SetName { key: SessionNameKey, name: String },
+    ClearName { key: SessionNameKey },
 }
 
 #[derive(Debug)]
 enum WorkerMsg {
     Snapshot(Snapshot),
     Error(String),
+    Status(String),
+    NameUpdated {
+        key: SessionNameKey,
+        name: Option<String>,
+    },
 }
 
 fn worker_loop(
@@ -83,6 +91,39 @@ fn worker_loop(
                 }
                 Err(e) => {
                     let _ = msg_tx.send(WorkerMsg::Error(format!("{e}")));
+                }
+            },
+            WorkerCmd::SetName { key, name } => match collector.set_session_name(key.clone(), name)
+            {
+                Ok(normalized) => {
+                    let _ = msg_tx.send(WorkerMsg::NameUpdated {
+                        key: key.clone(),
+                        name: normalized.clone(),
+                    });
+                    let tid = short_thread_id(&key.thread_id);
+                    let _ = msg_tx.send(WorkerMsg::Status(format!(
+                        "Saved name for ({}) {tid}",
+                        key.host
+                    )));
+                }
+                Err(e) => {
+                    let _ = msg_tx.send(WorkerMsg::Error(format!("failed to save name: {e}")));
+                }
+            },
+            WorkerCmd::ClearName { key } => match collector.clear_session_name(key.clone()) {
+                Ok(()) => {
+                    let _ = msg_tx.send(WorkerMsg::NameUpdated {
+                        key: key.clone(),
+                        name: None,
+                    });
+                    let tid = short_thread_id(&key.thread_id);
+                    let _ = msg_tx.send(WorkerMsg::Status(format!(
+                        "Cleared name for ({}) {tid}",
+                        key.host
+                    )));
+                }
+                Err(e) => {
+                    let _ = msg_tx.send(WorkerMsg::Error(format!("failed to clear name: {e}")));
                 }
             },
         }
@@ -200,11 +241,18 @@ fn group_sessions_for_display(sessions: &[SessionRow], debug: bool) -> Vec<Displ
         });
     }
 
-    // Stable sort: most recent activity first, then host, then thread id.
+    // Stable sort:
+    // 1) named sessions first (scanability)
+    // 2) most recent activity
+    // 3) host, then thread id (deterministic tiebreakers)
     out.sort_by(|a, b| {
+        let a_named = a.root.name.as_ref().is_some_and(|s| !s.trim().is_empty());
+        let b_named = b.root.name.as_ref().is_some_and(|s| !s.trim().is_empty());
         let a_ts = a.last_activity_unix_s.unwrap_or(i64::MIN);
         let b_ts = b.last_activity_unix_s.unwrap_or(i64::MIN);
-        b_ts.cmp(&a_ts)
+        b_named
+            .cmp(&a_named)
+            .then_with(|| b_ts.cmp(&a_ts))
             .then_with(|| a.root.host.cmp(&b.root.host))
             .then_with(|| a.root.thread_id.cmp(&b.root.thread_id))
     });
@@ -215,49 +263,237 @@ fn group_sessions_for_display(sessions: &[SessionRow], debug: bool) -> Vec<Displ
 struct App {
     refresh: Duration,
     debug: bool,
-    last_refresh_request: Instant,
+    refresh_in_flight: bool,
+    last_refresh_sent: Instant,
     last_snapshot: Option<Snapshot>,
     display_sessions: Vec<DisplaySessionRow>,
+    selected: Option<SessionNameKey>,
+    rename_modal: Option<RenameModal>,
     last_error: Option<String>,
-    cmd_tx: SyncSender<WorkerCmd>,
+    last_status: Option<(Instant, String)>,
+    last_warning_seen: Option<String>,
+    cmd_tx: Sender<WorkerCmd>,
     msg_rx: Receiver<WorkerMsg>,
+}
+
+#[derive(Clone, Debug)]
+struct RenameModal {
+    key: SessionNameKey,
+    buffer: String,
 }
 
 impl App {
     fn new(
         refresh_ms: u64,
         debug: bool,
-        cmd_tx: SyncSender<WorkerCmd>,
+        cmd_tx: Sender<WorkerCmd>,
         msg_rx: Receiver<WorkerMsg>,
     ) -> Self {
         Self {
             refresh: Duration::from_millis(refresh_ms.max(100)),
             debug,
-            last_refresh_request: Instant::now() - Duration::from_secs(999),
+            refresh_in_flight: false,
+            last_refresh_sent: Instant::now() - Duration::from_secs(999),
             last_snapshot: None,
             display_sessions: Vec::new(),
+            selected: None,
+            rename_modal: None,
             last_error: None,
+            last_status: None,
+            last_warning_seen: None,
             cmd_tx,
             msg_rx,
         }
     }
 
     fn request_refresh(&mut self) {
-        self.last_refresh_request = Instant::now();
-        let _ = self.cmd_tx.try_send(WorkerCmd::Refresh);
+        if self.refresh_in_flight {
+            return;
+        }
+        self.refresh_in_flight = true;
+        self.last_refresh_sent = Instant::now();
+        let _ = self.cmd_tx.send(WorkerCmd::Refresh);
     }
 
     fn poll_worker(&mut self) {
         while let Ok(msg) = self.msg_rx.try_recv() {
             match msg {
                 WorkerMsg::Snapshot(snap) => {
+                    let names_warning = snap
+                        .warnings
+                        .as_ref()
+                        .and_then(|w| w.iter().find(|s| s.starts_with("names store")))
+                        .cloned();
+
                     self.display_sessions = group_sessions_for_display(&snap.sessions, self.debug);
                     self.last_snapshot = Some(snap);
                     self.last_error = None;
+                    self.refresh_in_flight = false;
+                    self.reconcile_selection();
+
+                    if self.debug {
+                        if let Some(w) = names_warning {
+                            if self.last_warning_seen.as_deref() != Some(&w) {
+                                self.last_warning_seen = Some(w.clone());
+                                self.last_status = Some((Instant::now(), format!("WARN: {w}")));
+                            }
+                        }
+                    }
                 }
-                WorkerMsg::Error(e) => self.last_error = Some(e),
+                WorkerMsg::Error(e) => {
+                    self.last_error = Some(e);
+                    if self.refresh_in_flight {
+                        self.refresh_in_flight = false;
+                    }
+                }
+                WorkerMsg::Status(msg) => {
+                    self.last_status = Some((Instant::now(), msg));
+                }
+                WorkerMsg::NameUpdated { key, name } => {
+                    if let Some(snap) = self.last_snapshot.as_mut() {
+                        for row in &mut snap.sessions {
+                            if row.host == key.host && row.thread_id == key.thread_id {
+                                row.name = name.clone();
+                            }
+                        }
+                        self.display_sessions =
+                            group_sessions_for_display(&snap.sessions, self.debug);
+                        self.reconcile_selection();
+                    }
+                    self.last_error = None;
+                }
             }
         }
+    }
+
+    fn reconcile_selection(&mut self) {
+        if self.display_sessions.is_empty() {
+            self.selected = None;
+            return;
+        }
+
+        if let Some(sel) = self.selected.as_ref() {
+            if self
+                .display_sessions
+                .iter()
+                .any(|s| s.root.host == sel.host && s.root.thread_id == sel.thread_id)
+            {
+                return;
+            }
+        }
+
+        let first = &self.display_sessions[0].root;
+        self.selected = Some(SessionNameKey {
+            host: first.host.clone(),
+            thread_id: first.thread_id.clone(),
+        });
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        let sel = self.selected.as_ref()?;
+        self.display_sessions
+            .iter()
+            .position(|s| s.root.host == sel.host && s.root.thread_id == sel.thread_id)
+    }
+
+    fn select_prev(&mut self) {
+        let Some(idx) = self.selected_index() else {
+            self.reconcile_selection();
+            return;
+        };
+        let next = idx.saturating_sub(1);
+        let row = &self.display_sessions[next].root;
+        self.selected = Some(SessionNameKey {
+            host: row.host.clone(),
+            thread_id: row.thread_id.clone(),
+        });
+    }
+
+    fn select_next(&mut self) {
+        let Some(idx) = self.selected_index() else {
+            self.reconcile_selection();
+            return;
+        };
+        let next = (idx + 1).min(self.display_sessions.len().saturating_sub(1));
+        let row = &self.display_sessions[next].root;
+        self.selected = Some(SessionNameKey {
+            host: row.host.clone(),
+            thread_id: row.thread_id.clone(),
+        });
+    }
+
+    fn start_rename(&mut self) {
+        self.reconcile_selection();
+        let Some(sel) = self.selected.clone() else {
+            return;
+        };
+
+        let existing = self
+            .display_sessions
+            .iter()
+            .find(|s| s.root.host == sel.host && s.root.thread_id == sel.thread_id)
+            .and_then(|s| s.root.name.clone())
+            .unwrap_or_default();
+
+        self.rename_modal = Some(RenameModal {
+            key: sel,
+            buffer: existing,
+        });
+    }
+
+    fn commit_rename(&mut self) {
+        let Some(modal) = self.rename_modal.take() else {
+            return;
+        };
+        let key = modal.key;
+        let trimmed = modal.buffer.trim().to_string();
+        if trimmed.is_empty() {
+            let _ = self.cmd_tx.send(WorkerCmd::ClearName { key });
+        } else {
+            let _ = self.cmd_tx.send(WorkerCmd::SetName { key, name: trimmed });
+        }
+    }
+
+    fn clear_name(&mut self) {
+        self.reconcile_selection();
+        let Some(key) = self.selected.clone() else {
+            return;
+        };
+        let _ = self.cmd_tx.send(WorkerCmd::ClearName { key });
+    }
+
+    fn handle_key(&mut self, code: KeyCode) -> bool {
+        if self.rename_modal.is_some() {
+            match code {
+                KeyCode::Esc => self.rename_modal = None,
+                KeyCode::Enter => self.commit_rename(),
+                KeyCode::Backspace => {
+                    if let Some(modal) = self.rename_modal.as_mut() {
+                        modal.buffer.pop();
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if !c.is_control() {
+                        if let Some(modal) = self.rename_modal.as_mut() {
+                            modal.buffer.push(c);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        match code {
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => return true,
+            KeyCode::Char('r') | KeyCode::Char('R') => self.request_refresh(),
+            KeyCode::Up => self.select_prev(),
+            KeyCode::Down => self.select_next(),
+            KeyCode::Char('n') | KeyCode::Char('N') => self.start_rename(),
+            KeyCode::Char('x') | KeyCode::Char('X') => self.clear_name(),
+            _ => {}
+        }
+        false
     }
 }
 
@@ -266,7 +502,7 @@ fn run_loop(
     app: &mut App,
 ) -> anyhow::Result<()> {
     loop {
-        if app.last_refresh_request.elapsed() >= app.refresh {
+        if app.rename_modal.is_none() && app.last_refresh_sent.elapsed() >= app.refresh {
             app.request_refresh();
         }
 
@@ -276,11 +512,11 @@ fn run_loop(
 
         if event::poll(Duration::from_millis(50)).unwrap_or(false) {
             match event::read().context("read event")? {
-                Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Char('r') => app.request_refresh(),
-                    _ => {}
-                },
+                Event::Key(k) if k.kind == KeyEventKind::Press => {
+                    if app.handle_key(k.code) {
+                        return Ok(());
+                    }
+                }
                 _ => {}
             }
         }
@@ -299,7 +535,13 @@ fn draw_ui(f: &mut ratatui::Frame, app: &App) {
     f.render_widget(header, chunks[0]);
 
     let table = sessions_table(app, chunks[1]);
-    f.render_widget(table, chunks[1]);
+    let mut state = TableState::default();
+    state.select(app.selected_index());
+    f.render_stateful_widget(table, chunks[1], &mut state);
+
+    if let Some(modal) = app.rename_modal.as_ref() {
+        render_rename_modal(f, modal, area);
+    }
 }
 
 fn header_line(app: &App, area: Rect) -> Paragraph {
@@ -322,29 +564,29 @@ fn header_line(app: &App, area: Rect) -> Paragraph {
         .map(|v| v.len())
         .unwrap_or(0);
 
-    let mut spans = Vec::new();
-    spans.push(Span::styled(
+    let mut header_spans = Vec::new();
+    header_spans.push(Span::styled(
         "codex-ps  ",
         Style::default().add_modifier(Modifier::BOLD),
     ));
-    spans.push(Span::raw(format!("hosts: {host_sel}  ")));
-    spans.push(Span::raw(format!("sessions: {display_rows}  ")));
+    header_spans.push(Span::raw(format!("hosts: {host_sel}  ")));
+    header_spans.push(Span::raw(format!("sessions: {display_rows}  ")));
     if raw_threads != display_rows {
-        spans.push(Span::raw(format!("threads: {raw_threads}  ")));
+        header_spans.push(Span::raw(format!("threads: {raw_threads}  ")));
     }
     if host_errs > 0 {
-        spans.push(Span::styled(
+        header_spans.push(Span::styled(
             format!("errors: {host_errs}  "),
             Style::default().fg(Color::Red),
         ));
     }
-    spans.push(Span::raw(format!(
+    header_spans.push(Span::raw(format!(
         "refresh: {}ms  ",
         app.refresh.as_millis()
     )));
 
     if let Some(err) = app.last_error.as_ref() {
-        spans.push(Span::styled(
+        header_spans.push(Span::styled(
             truncate_middle(err, area.width.saturating_sub(30) as usize),
             Style::default().fg(Color::Red),
         ));
@@ -356,13 +598,43 @@ fn header_line(app: &App, area: Rect) -> Paragraph {
             .map(|s| s.generated_at_unix_s)
             .unwrap_or(0);
         let age = now_s.saturating_sub(updated_s);
-        spans.push(Span::styled(
+        header_spans.push(Span::styled(
             format!("updated: {age}s ago"),
             Style::default().fg(Color::DarkGray),
         ));
     }
 
-    Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::NONE))
+    let mut lines = Vec::new();
+    lines.push(Line::from(header_spans));
+
+    let mut help_spans = Vec::new();
+    if app.rename_modal.is_some() {
+        help_spans.push(Span::styled(
+            "Keys: ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        help_spans.push(Span::raw("Enter save  Esc cancel  Backspace delete"));
+    } else {
+        help_spans.push(Span::styled(
+            "Keys: ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        help_spans.push(Span::raw("↑/↓ select  n name  x clear  r refresh  q quit"));
+    }
+
+    if let Some((at, msg)) = app.last_status.as_ref() {
+        if at.elapsed() <= Duration::from_secs(4) {
+            help_spans.push(Span::raw("   "));
+            help_spans.push(Span::styled(
+                format!("Status: {msg}"),
+                Style::default().fg(Color::Green),
+            ));
+        }
+    }
+
+    lines.push(Line::from(help_spans));
+
+    Paragraph::new(lines).block(Block::default().borders(Borders::NONE))
 }
 
 fn sessions_table(app: &App, _area: Rect) -> Table {
@@ -375,6 +647,7 @@ fn sessions_table(app: &App, _area: Rect) -> Table {
         Cell::from("SUB"),
         Cell::from("STATE"),
         Cell::from("AGE"),
+        Cell::from("NAME"),
         Cell::from("TITLE"),
         Cell::from("BRANCH"),
         Cell::from("PWD"),
@@ -397,8 +670,9 @@ fn sessions_table(app: &App, _area: Rect) -> Table {
         Constraint::Length(10), // SUB
         Constraint::Length(5),  // STATE
         Constraint::Length(6),  // AGE
+        Constraint::Length(22), // NAME
         Constraint::Length(18), // TITLE
-        Constraint::Length(36), // BRANCH
+        Constraint::Length(28), // BRANCH
         Constraint::Min(18),    // PWD
     ];
     if app.debug {
@@ -413,7 +687,8 @@ fn sessions_table(app: &App, _area: Rect) -> Table {
                 .title("Active Codex Sessions"),
         )
         .column_spacing(1)
-        .highlight_style(Style::default())
+        .highlight_symbol("> ")
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
 }
 
 fn short_thread_id(thread_id: &str) -> String {
@@ -481,7 +756,7 @@ fn row_for_session(s: &DisplaySessionRow, debug: bool) -> Row {
 
     let (state_text, state_style) = match s.status {
         SessionStatus::Working => ("WORK", Style::default().fg(Color::Green)),
-        SessionStatus::Waiting => ("WAIT", Style::default().fg(Color::Yellow)),
+        SessionStatus::Waiting => ("IDLE", Style::default().fg(Color::Yellow)),
         SessionStatus::Unknown => ("UNK", Style::default().fg(Color::Red)),
     };
 
@@ -504,9 +779,17 @@ fn row_for_session(s: &DisplaySessionRow, debug: bool) -> Row {
         .unwrap_or_else(|| "?".into());
 
     let title = s.root.title.as_deref().unwrap_or("unknown");
+    let name = s
+        .root
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("(unset)");
     let branch = s.root.git_branch.as_deref().unwrap_or("unknown");
     let why = s.reason.as_deref().unwrap_or("");
 
+    let name = truncate_middle(name, 22);
     let title = truncate_middle(title, 18);
     let branch = branch.to_string();
     let pwd = s
@@ -526,6 +809,7 @@ fn row_for_session(s: &DisplaySessionRow, debug: bool) -> Row {
         Cell::from(sub),
         Cell::from(Span::styled(state_text, state_style)),
         Cell::from(age),
+        Cell::from(name),
         Cell::from(title),
         Cell::from(branch),
         Cell::from(pwd),
@@ -541,4 +825,84 @@ fn row_for_session(s: &DisplaySessionRow, debug: bool) -> Row {
     }
 
     row
+}
+
+fn render_rename_modal(f: &mut ratatui::Frame, modal: &RenameModal, area: Rect) {
+    let width = area.width.min(80).max(40);
+    let height = area.height.min(9).max(7);
+    let rect = centered_rect(width, height, area);
+
+    f.render_widget(Clear, rect);
+
+    let tid = short_thread_id(&modal.key.thread_id);
+    let title = format!("Name session ({}) {tid}", modal.key.host);
+
+    let input_max = rect.width.saturating_sub(4) as usize;
+    let input = format!("> {}_", modal.buffer);
+    let input = truncate_middle(&input, input_max);
+
+    let lines = vec![
+        Line::raw(""),
+        Line::raw(input),
+        Line::raw(""),
+        Line::styled(
+            "Enter = Save    Esc = Cancel",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+
+    let widget = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(widget, rect);
+}
+
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(width) / 2);
+    let y = area.y + (area.height.saturating_sub(height) / 2);
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(thread_id: &str, name: Option<&str>, last_activity_unix_s: Option<i64>) -> SessionRow {
+        SessionRow {
+            host: "local".into(),
+            thread_id: thread_id.into(),
+            pids: Vec::new(),
+            tty: None,
+            title: Some("t".into()),
+            name: name.map(|s| s.to_string()),
+            cwd: None,
+            repo_root: None,
+            git_branch: None,
+            git_commit: None,
+            session_source: None,
+            forked_from_id: None,
+            subagent_parent_thread_id: None,
+            subagent_depth: None,
+            status: SessionStatus::Waiting,
+            last_activity_unix_s,
+            rollout_path: None,
+            debug: None,
+        }
+    }
+
+    #[test]
+    fn named_rows_sort_above_unnamed_rows() {
+        let named_old = row("a", Some("release triage"), Some(100));
+        let unnamed_new = row("b", None, Some(200));
+
+        let out = group_sessions_for_display(&[unnamed_new, named_old], false);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].root.thread_id, "a");
+        assert_eq!(out[1].root.thread_id, "b");
+    }
 }
